@@ -20,6 +20,7 @@ private let MAA_TOOLS_VERSION = 3
 
     private var windowTitle: String?
     private var tid: Int?
+    private var lastTouchPoint: CGPoint?
 
     private var scale = 1.0
     private var width = 0
@@ -115,6 +116,10 @@ private let MAA_TOOLS_VERSION = 3
 
     private func handlerTask(on connection: NWConnection) -> Task<Void, Error> {
         Task {
+            defer {
+                resetTouch()
+            }
+
             let (handshake, _, _) = try await connection.receive(minimumIncompleteLength: 4, maximumLength: 4)
             guard handshake == connectionMagic else {
                 throw MaaToolsError.invalidMessage
@@ -217,6 +222,8 @@ private let MAA_TOOLS_VERSION = 3
     }
 
     private func toucherDispatch(_ content: Data, on _: NWConnection) {
+        guard content.count >= 9 else { return }
+
         let touchPhase = content[4]
 
         let pointX = content.u16(at: 5).divRound(by: scale)
@@ -236,18 +243,40 @@ private let MAA_TOOLS_VERSION = 3
     }
 
     private func toucherDown(atX: Int, atY: Int) {
-        Toucher.touchcam(point: .init(x: atX, y: atY), phase: .began, tid: &tid,
+        resetTouch()
+
+        let point = CGPoint(x: atX, y: atY)
+        lastTouchPoint = point
+        Toucher.touchcam(point: point, phase: .began, tid: &tid,
                          actionName: "down", keyName: "touch")
     }
 
     private func toucherMove(atX: Int, atY: Int) {
-        Toucher.touchcam(point: .init(x: atX, y: atY), phase: .moved, tid: &tid,
+        let point = CGPoint(x: atX, y: atY)
+        lastTouchPoint = point
+        Toucher.touchcam(point: point, phase: .moved, tid: &tid,
                          actionName: "move", keyName: "touch")
     }
 
     private func toucherUp(atX: Int, atY: Int) {
-        Toucher.touchcam(point: .init(x: atX, y: atY), phase: .ended, tid: &tid,
+        let point = CGPoint(x: atX, y: atY)
+        lastTouchPoint = point
+        Toucher.touchcam(point: point, phase: .ended, tid: &tid,
                          actionName: "up", keyName: "touch")
+        lastTouchPoint = nil
+    }
+
+    private func resetTouch() {
+        guard tid != nil else {
+            Toucher.keyView = nil
+            lastTouchPoint = nil
+            return
+        }
+
+        Toucher.touchcam(point: lastTouchPoint ?? .zero, phase: .cancelled, tid: &tid,
+                         actionName: "cancel", keyName: "touch")
+        Toucher.keyView = nil
+        lastTouchPoint = nil
     }
 
     private func version(to connection: NWConnection) async throws {
