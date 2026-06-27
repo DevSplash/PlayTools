@@ -9,7 +9,7 @@ import Accelerate
 import Network
 import OSLog
 
-private let MAA_TOOLS_VERSION = 3
+private let MAA_TOOLS_VERSION = 4
 
 @MainActor final class MaaTools {
     public static let shared = MaaTools()
@@ -36,6 +36,8 @@ private let MAA_TOOLS_VERSION = 3
     private let terminateMagic = Data([0x54, 0x45, 0x52, 0x4d])
     // ['T', 'U', 'C', 'H']
     private let toucherMagic = Data([0x54, 0x55, 0x43, 0x48])
+    // ['T', 'S', 'Y', 'N']
+    private let toucherSyncMagic = Data([0x54, 0x53, 0x59, 0x4e])
     // ['V', 'E', 'R', 'N']
     private let versionMagic = Data([0x56, 0x45, 0x52, 0x4e])
     // ['B', 'N', 'D', 'L']
@@ -136,6 +138,8 @@ private let MAA_TOOLS_VERSION = 3
                     AKInterface.shared?.terminateApplication()
                 case toucherMagic:
                     toucherDispatch(payload, on: connection)
+                case toucherSyncMagic:
+                    try await toucherSync(to: connection)
                 case versionMagic:
                     try await version(to: connection)
                 case bundleMagic:
@@ -277,6 +281,15 @@ private let MAA_TOOLS_VERSION = 3
                          actionName: "cancel", keyName: "touch")
         Toucher.keyView = nil
         lastTouchPoint = nil
+    }
+
+    private func toucherSync(to connection: NWConnection) async throws {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            PTFakeMetaTouch.syncPendingEvents {
+                continuation.resume()
+            }
+        }
+        try await connection.send(content: "OKAY".data(using: .ascii))
     }
 
     private func version(to connection: NWConnection) async throws {

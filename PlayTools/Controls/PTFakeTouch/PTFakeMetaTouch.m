@@ -15,13 +15,45 @@
 #include <dlfcn.h>
 #include <string.h>
 
+@interface PTFakeTouchSyncWaiter : NSObject
+@property (nonatomic) unsigned long long targetSequence;
+@property (nonatomic, copy) void (^completion)(void);
+@end
+
+@implementation PTFakeTouchSyncWaiter
+@end
+
 static NSMutableArray *livingTouchAry;
+static NSMutableArray<PTFakeTouchSyncWaiter *> *syncWaiters;
 atomic_ullong reusageMask = ATOMIC_VAR_INIT(0);
+atomic_ullong pendingTouchSequence = ATOMIC_VAR_INIT(0);
+atomic_ullong deliveredTouchSequence = ATOMIC_VAR_INIT(0);
 static CFRunLoopSourceRef source;
 
 NSLock *lock;
+NSLock *syncLock;
+
+static void drainSyncWaiters(unsigned long long deliveredSequence) {
+    NSMutableArray<PTFakeTouchSyncWaiter *> *ready = [[NSMutableArray alloc] init];
+    [syncLock lock];
+    atomic_store(&deliveredTouchSequence, deliveredSequence);
+    NSIndexSet *readyIndexes = [syncWaiters indexesOfObjectsPassingTest:
+        ^BOOL(PTFakeTouchSyncWaiter *waiter, NSUInteger idx, BOOL *stop) {
+            return waiter.targetSequence <= deliveredSequence;
+        }];
+    if ([readyIndexes count] > 0) {
+        [ready addObjectsFromArray:[syncWaiters objectsAtIndexes:readyIndexes]];
+        [syncWaiters removeObjectsAtIndexes:readyIndexes];
+    }
+    [syncLock unlock];
+
+    for (PTFakeTouchSyncWaiter *waiter in ready) {
+        waiter.completion();
+    }
+}
 
 void eventSendCallback(void* info) {
+    unsigned long long targetSequence = atomic_load(&pendingTouchSequence);
     UIEvent *event = [[UIApplication sharedApplication] _touchesEvent];
     [event _clearTouches];
     // Step1: copy touches and record began touches and mark recyclable touches
@@ -59,20 +91,47 @@ void eventSendCallback(void* info) {
             }
         }
     }
+    drainSyncWaiters(targetSequence);
 }
 
 @implementation PTFakeMetaTouch
 
 + (void)load {
     livingTouchAry = [[NSMutableArray alloc] init];
+    syncWaiters = [[NSMutableArray alloc] init];
     CFRunLoopSourceContext context;
     memset(&context, 0, sizeof(CFRunLoopSourceContext));
     context.perform = eventSendCallback;
     lock = [[NSLock alloc] init];
+    syncLock = [[NSLock alloc] init];
     // content of context is copied
     source = CFRunLoopSourceCreate(NULL, -2, &context);
     CFRunLoopRef loop = CFRunLoopGetMain();
     CFRunLoopAddSource(loop, source, kCFRunLoopCommonModes);
+}
+
++ (void)syncPendingEvents:(void (^)(void))completion {
+    if (completion == nil) {
+        return;
+    }
+
+    unsigned long long targetSequence = atomic_load(&pendingTouchSequence);
+    unsigned long long deliveredSequence = atomic_load(&deliveredTouchSequence);
+    if (deliveredSequence >= targetSequence) {
+        dispatch_async(dispatch_get_main_queue(), completion);
+        return;
+    }
+
+    PTFakeTouchSyncWaiter *waiter = [[PTFakeTouchSyncWaiter alloc] init];
+    waiter.targetSequence = targetSequence;
+    waiter.completion = completion;
+
+    [syncLock lock];
+    [syncWaiters addObject:waiter];
+    [syncLock unlock];
+
+    CFRunLoopSourceSignal(source);
+    CFRunLoopWakeUp(CFRunLoopGetMain());
 }
 
 + (NSInteger)fakeTouchId: (NSInteger)pointId AtPoint: (CGPoint)point withTouchPhase: (UITouchPhase)phase inWindow: (UIWindow*)window onView:(UIView*)view {
@@ -116,7 +175,9 @@ void eventSendCallback(void* info) {
             [touch setPhaseAndUpdateTimestamp:phase];
         }
     }
+    atomic_fetch_add(&pendingTouchSequence, 1);
     CFRunLoopSourceSignal(source);
+    CFRunLoopWakeUp(CFRunLoopGetMain());
     // Check on actual phase of touch
     if([touch phase] == UITouchPhaseEnded || [touch phase] == UITouchPhaseCancelled) {
         pointId = -1;

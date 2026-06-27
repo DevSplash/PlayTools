@@ -26,4 +26,6 @@
 
 + (NSInteger)fakeTouchId:(NSInteger)pointId AtPoint:(CGPoint)point withTouchPhase:(UITouchPhase)phase inWindow:(UIWindow*)window onView:(UIView*)view;
 
++ (void)syncPendingEvents:(void (^)(void))completion;
+
 @end
