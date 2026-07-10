@@ -3,6 +3,32 @@ import UIKit
 
 let settings = PlaySettings.shared
 
+enum ContentScaleCompensationMode: Int, Codable, Hashable {
+    case disabled = 0
+    case automatic = 1
+    case custom = 2
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        // Accept temporary mode values written by earlier development builds.
+        switch try container.decode(Int.self) {
+        case Self.automatic.rawValue:
+            self = .automatic
+        case Self.custom.rawValue, 4:
+            self = .custom
+        case Self.disabled.rawValue, 3:
+            self = .disabled
+        default:
+            self = .disabled
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+}
+
 @objc public final class PlaySettings: NSObject {
     @objc public static let shared = PlaySettings()
 
@@ -117,7 +143,7 @@ struct AppSettingsData: Codable {
     var resolution = 2
     var targetWindowWidth: Int?
     var targetWindowHeight: Int?
-    var contentScaleCompensationMode: Int?
+    var contentScaleCompensationMode: ContentScaleCompensationMode?
     var contentScaleCompensationValue: Double?
     var aspectRatio = 1
     var displayRotation = 0
@@ -172,21 +198,8 @@ struct AppSettingsData: Codable {
         return max(1, Int((Double(value) / scale).rounded(.up)))
     }
 
-    private var normalizedContentScaleCompensationMode: Int {
-        switch contentScaleCompensationMode ?? 0 {
-        case 2:
-            return 1
-        case 3:
-            return 0
-        case 4:
-            return 2
-        default:
-            return contentScaleCompensationMode ?? 0
-        }
-    }
-
     private var contentScaleCompensationActive: Bool {
-        resolution != 0 && resolution != 6 && normalizedContentScaleCompensationMode != 0
+        resolution != 0 && resolution != 6 && (contentScaleCompensationMode ?? .disabled) != .disabled
     }
 
     private var contentScaleCompensationScale: Double {
@@ -194,12 +207,12 @@ struct AppSettingsData: Codable {
             return 1.0
         }
 
-        switch normalizedContentScaleCompensationMode {
-        case 1:
+        switch contentScaleCompensationMode ?? .disabled {
+        case .automatic:
             return 0.77
-        case 2:
+        case .custom:
             return max(contentScaleCompensationValue ?? 0.77, 0.01)
-        default:
+        case .disabled:
             return 1.0
         }
     }

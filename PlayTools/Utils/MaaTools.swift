@@ -10,6 +10,7 @@ import Network
 import OSLog
 
 private let MAA_TOOLS_VERSION = 5
+private let TOUCH_SYNC_TIMEOUT: TimeInterval = 3
 
 @MainActor final class MaaTools {
     public static let shared = MaaTools()
@@ -17,6 +18,8 @@ private let MAA_TOOLS_VERSION = 5
     private let logger = Logger(subsystem: "PlayTools", category: "MaaTools")
     private let queue = DispatchQueue(label: "MaaTools", qos: .default)
     private var listener: NWListener?
+    private var activeConnection: NWConnection?
+    private var activeConnectionDidTouch = false
 
     private var windowTitle: String?
     private var tid: Int?
@@ -25,7 +28,7 @@ private let MAA_TOOLS_VERSION = 5
     private var scale = 1.0
     private var width = 0
     private var height = 0
-    private var didLogWindowMetrics = false
+    private var lastWindowMetrics: String?
 
     // ['M', 'A', 'A', 0x00]
     private let connectionMagic = Data([0x4d, 0x41, 0x41, 0x00])
@@ -76,17 +79,20 @@ private let MAA_TOOLS_VERSION = 5
             logWindowMetrics(for: screen)
         }
 
-        windowTitle = AKInterface.shared?.windowTitle
+        if windowTitle == nil {
+            windowTitle = AKInterface.shared?.windowTitle
+        }
     }
 
     private func logWindowMetrics(for screen: UIScreen) {
-        guard !didLogWindowMetrics else { return }
-
-        didLogWindowMetrics = true
         let bounds = format(screen.bounds)
         let nativeBounds = format(screen.nativeBounds)
         let frame = format(AKInterface.shared?.windowFrame ?? CGRect())
         let content = format(AKInterface.shared?.windowContentRect ?? CGRect())
+        let metrics = "\(bounds)|\(nativeBounds)|\(screen.nativeScale)|\(frame)|\(content)"
+        guard lastWindowMetrics != metrics else { return }
+
+        lastWindowMetrics = metrics
         logger.debug("UIScreen.bounds \(bounds, privacy: .public)")
         logger.debug("UIScreen.nativeBounds \(nativeBounds, privacy: .public)")
         logger.debug("UIScreen.nativeScale \(screen.nativeScale, privacy: .public)")
@@ -102,12 +108,7 @@ private let MAA_TOOLS_VERSION = 5
             newConnection.start(queue: strongSelf.queue)
 
             Task {
-                do {
-                    try await strongSelf.handlerTask(on: newConnection).value
-                } catch {
-                    strongSelf.logger.error("Receive failed: \(error)")
-                }
-                newConnection.cancel()
+                await strongSelf.handleConnection(newConnection)
             }
         }
 
@@ -134,43 +135,69 @@ private let MAA_TOOLS_VERSION = 5
 
     // swiftlint:disable cyclomatic_complexity
 
-    private func handlerTask(on connection: NWConnection) -> Task<Void, Error> {
-        Task {
-            defer {
-                resetTouch()
+    private func handleConnection(_ connection: NWConnection) async {
+        var ownsTouchState = false
+        defer {
+            if ownsTouchState && activeConnection === connection {
+                if activeConnectionDidTouch {
+                    resetTouch()
+                }
+                activeConnectionDidTouch = false
+                activeConnection = nil
             }
+            connection.cancel()
+        }
 
-            let (handshake, _, _) = try await connection.receive(minimumIncompleteLength: 4, maximumLength: 4)
+        do {
+            let (handshake, _, _) = try await connection.receive(
+                minimumIncompleteLength: 4,
+                maximumLength: 4
+            )
             guard handshake == connectionMagic else {
                 throw MaaToolsError.invalidMessage
             }
-            try await connection.send(content: "OKAY".data(using: .ascii))
+            guard activeConnection == nil else {
+                logger.warning("Rejected a second MaaTools client")
+                return
+            }
 
-            for try await payload in readPayload(from: connection) {
-                switch payload.prefix(4) {
-                case screencapMagic:
-                    try await screencap(to: connection)
-                case sizeMagic:
-                    try await screensize(to: connection)
-                case terminateMagic:
-                    AKInterface.shared?.terminateApplication()
-                case toucherMagic:
-                    toucherDispatch(payload, on: connection)
-                case toucherSyncMagic:
-                    try await toucherSync(to: connection)
-                case versionMagic:
-                    try await version(to: connection)
-                case bundleMagic:
-                    try await bundleID(to: connection)
-                case rectMagic:
-                    try await rectangle(to: connection)
-                case bgrMagic:
-                    try await bgrScreencap(to: connection)
-                case nativeScreencapMagic:
-                    try await nativeScreencap(to: connection)
-                default:
-                    break
-                }
+            activeConnection = connection
+            activeConnectionDidTouch = false
+            ownsTouchState = true
+            try await connection.send(content: "OKAY".data(using: .ascii))
+            try await handleMessages(on: connection)
+        } catch MaaToolsError.connectionClosed {
+            logger.debug("Client disconnected")
+        } catch {
+            logger.error("Receive failed: \(error)")
+        }
+    }
+
+    private func handleMessages(on connection: NWConnection) async throws {
+        for try await payload in readPayload(from: connection) {
+            switch payload.prefix(4) {
+            case screencapMagic:
+                try await screencap(to: connection)
+            case sizeMagic:
+                try await screensize(to: connection)
+            case terminateMagic:
+                AKInterface.shared?.terminateApplication()
+            case toucherMagic:
+                toucherDispatch(payload, on: connection)
+            case toucherSyncMagic:
+                try await toucherSync(to: connection)
+            case versionMagic:
+                try await version(to: connection)
+            case bundleMagic:
+                try await bundleID(to: connection)
+            case rectMagic:
+                try await rectangle(to: connection)
+            case bgrMagic:
+                try await bgrScreencap(to: connection)
+            case nativeScreencapMagic:
+                try await nativeScreencap(to: connection)
+            default:
+                break
             }
         }
     }
@@ -207,6 +234,7 @@ private let MAA_TOOLS_VERSION = 5
     // swiftlint:enable line_length
 
     private func screencap(to connection: NWConnection) async throws {
+        setupWindow()
         let data = screenshot() ?? Data()
         try await connection.send(content: data.count.u32Bytes + data)
     }
@@ -243,11 +271,14 @@ private let MAA_TOOLS_VERSION = 5
     }
 
     private func screensize(to connection: NWConnection) async throws {
+        setupWindow()
         try await connection.send(content: width.u16Bytes + height.u16Bytes)
     }
 
     private func toucherDispatch(_ content: Data, on _: NWConnection) {
         guard content.count >= 9 else { return }
+        setupWindow()
+        activeConnectionDidTouch = true
 
         let touchPhase = content[4]
 
@@ -304,13 +335,22 @@ private let MAA_TOOLS_VERSION = 5
         lastTouchPoint = nil
     }
 
-    private func toucherSync(to connection: NWConnection) async throws {
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            PTFakeMetaTouch.syncPendingEvents {
-                continuation.resume()
+    nonisolated private func toucherSync(to connection: NWConnection) async throws {
+        let _: Bool = try await withCheckedThrowingContinuation { continuation in
+            PTFakeMetaTouch.syncPendingEvents(timeout: TOUCH_SYNC_TIMEOUT) { delivered in
+                let response = delivered ? "OKAY" : "FAIL"
+                connection.send(
+                    content: response.data(using: .ascii),
+                    completion: .contentProcessed { error in
+                        if let error {
+                            continuation.resume(throwing: error)
+                        } else {
+                            continuation.resume(returning: delivered)
+                        }
+                    }
+                )
             }
         }
-        try await connection.send(content: "OKAY".data(using: .ascii))
     }
 
     private func version(to connection: NWConnection) async throws {
@@ -342,6 +382,7 @@ private let MAA_TOOLS_VERSION = 5
     }
 
     private func bgrScreenshot() -> (Int, Int, Data)? {
+        setupWindow()
         guard let image = AKInterface.shared?.windowImage else {
             logger.error("Failed to fetch CGImage")
             return nil
@@ -433,6 +474,7 @@ private let MAA_TOOLS_VERSION = 5
 }
 
 private enum MaaToolsError: Error {
+    case connectionClosed
     case emptyContent
     case invalidMessage
 }
@@ -469,6 +511,11 @@ private extension NWConnection {
             receive(minimumIncompleteLength: minimumIncompleteLength, maximumLength: maximumLength) { content, contentContext, isComplete, error in
                 if let error {
                     continuation.resume(throwing: error)
+                    return
+                }
+
+                if isComplete && (content?.isEmpty ?? true) {
+                    continuation.resume(throwing: MaaToolsError.connectionClosed)
                     return
                 }
 

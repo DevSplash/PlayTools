@@ -28,4 +28,8 @@
 
 + (void)syncPendingEvents:(void (^)(void))completion;
 
++ (void)syncPendingEventsWithTimeout:(NSTimeInterval)timeout
+                          completion:(void (^)(BOOL delivered))completion
+    NS_SWIFT_NAME(syncPendingEvents(timeout:completion:));
+
 @end

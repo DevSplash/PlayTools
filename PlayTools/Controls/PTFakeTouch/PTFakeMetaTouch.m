@@ -17,7 +17,7 @@
 
 @interface PTFakeTouchSyncWaiter : NSObject
 @property (nonatomic) unsigned long long targetSequence;
-@property (nonatomic, copy) void (^completion)(void);
+@property (nonatomic, copy) void (^completion)(BOOL delivered);
 @end
 
 @implementation PTFakeTouchSyncWaiter
@@ -48,7 +48,7 @@ static void drainSyncWaiters(unsigned long long deliveredSequence) {
     [syncLock unlock];
 
     for (PTFakeTouchSyncWaiter *waiter in ready) {
-        waiter.completion();
+        waiter.completion(YES);
     }
 }
 
@@ -115,10 +115,23 @@ void eventSendCallback(void* info) {
         return;
     }
 
+    [self syncPendingEventsWithTimeout:0 completion:^(BOOL delivered) {
+        if (delivered) {
+            completion();
+        }
+    }];
+}
+
++ (void)syncPendingEventsWithTimeout:(NSTimeInterval)timeout
+                          completion:(void (^)(BOOL delivered))completion {
+    if (completion == nil) {
+        return;
+    }
+
     unsigned long long targetSequence = atomic_load(&pendingTouchSequence);
     unsigned long long deliveredSequence = atomic_load(&deliveredTouchSequence);
     if (deliveredSequence >= targetSequence) {
-        dispatch_async(dispatch_get_main_queue(), completion);
+        completion(YES);
         return;
     }
 
@@ -129,6 +142,26 @@ void eventSendCallback(void* info) {
     [syncLock lock];
     [syncWaiters addObject:waiter];
     [syncLock unlock];
+
+    if (timeout > 0) {
+        int64_t delay = (int64_t)(timeout * (NSTimeInterval)NSEC_PER_SEC);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delay),
+                       dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            void (^timeoutCompletion)(BOOL) = nil;
+            [syncLock lock];
+            NSUInteger index = [syncWaiters indexOfObjectIdenticalTo:waiter];
+            if (index != NSNotFound) {
+                timeoutCompletion = waiter.completion;
+                [syncWaiters removeObjectAtIndex:index];
+            }
+            [syncLock unlock];
+
+            if (timeoutCompletion != nil) {
+                NSLog(@"[PlayTools:MaaTools] Touch synchronization timed out");
+                timeoutCompletion(NO);
+            }
+        });
+    }
 
     CFRunLoopSourceSignal(source);
     CFRunLoopWakeUp(CFRunLoopGetMain());
