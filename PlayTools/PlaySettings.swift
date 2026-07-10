@@ -33,9 +33,9 @@ let settings = PlaySettings.shared
 
     @objc lazy var bypass = settingsData.bypass
 
-    @objc lazy var windowSizeHeight = CGFloat(settingsData.windowHeight)
+    @objc lazy var windowSizeHeight = CGFloat(settingsData.compensatedWindowHeight)
 
-    @objc lazy var windowSizeWidth = CGFloat(settingsData.windowWidth)
+    @objc lazy var windowSizeWidth = CGFloat(settingsData.compensatedWindowWidth)
 
     @objc lazy var inverseScreenValues = settingsData.inverseScreenValues
 
@@ -80,7 +80,7 @@ let settings = PlaySettings.shared
 
     @objc lazy var windowFixMethod = settingsData.windowFixMethod
 
-    @objc lazy var customScaler = settingsData.customScaler
+    @objc lazy var customScaler = settingsData.effectiveCustomScaler
 
     @objc lazy var rootWorkDir = settingsData.rootWorkDir
 
@@ -115,6 +115,10 @@ struct AppSettingsData: Codable {
     var windowHeight = 1080
     var customScaler = 2.0
     var resolution = 2
+    var targetWindowWidth: Int?
+    var targetWindowHeight: Int?
+    var contentScaleCompensationMode: Int?
+    var contentScaleCompensationValue: Double?
     var aspectRatio = 1
     var displayRotation = 0
     var notch = false
@@ -140,4 +144,63 @@ struct AppSettingsData: Codable {
     var resizableAspectRatioHeight = 0
     var blockSleepSpamming = false
     var ignoreUnityKeyboardInitializationError = false
+
+    var compensatedWindowWidth: Int {
+        compensatedResolution(targetWindowWidth ?? windowWidth)
+    }
+
+    var compensatedWindowHeight: Int {
+        compensatedResolution(targetWindowHeight ?? windowHeight)
+    }
+
+    var effectiveCustomScaler: Double {
+        guard contentScaleCompensationActive else {
+            return customScaler
+        }
+
+        let targetWidth = targetWindowWidth ?? windowWidth
+        let internalWidth = compensatedWindowWidth
+        guard internalWidth > 0 else {
+            return customScaler
+        }
+
+        return Double(targetWidth) / Double(internalWidth)
+    }
+
+    private func compensatedResolution(_ value: Int) -> Int {
+        let scale = contentScaleCompensationScale
+        return max(1, Int((Double(value) / scale).rounded(.up)))
+    }
+
+    private var normalizedContentScaleCompensationMode: Int {
+        switch contentScaleCompensationMode ?? 0 {
+        case 2:
+            return 1
+        case 3:
+            return 0
+        case 4:
+            return 2
+        default:
+            return contentScaleCompensationMode ?? 0
+        }
+    }
+
+    private var contentScaleCompensationActive: Bool {
+        resolution != 0 && resolution != 6 && normalizedContentScaleCompensationMode != 0
+    }
+
+    private var contentScaleCompensationScale: Double {
+        guard contentScaleCompensationActive else {
+            return 1.0
+        }
+
+        switch normalizedContentScaleCompensationMode {
+        case 1:
+            return 0.77
+        case 2:
+            return max(contentScaleCompensationValue ?? 0.77, 0.01)
+        default:
+            return 1.0
+        }
+    }
 }

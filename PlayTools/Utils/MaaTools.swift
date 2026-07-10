@@ -9,7 +9,7 @@ import Accelerate
 import Network
 import OSLog
 
-private let MAA_TOOLS_VERSION = 4
+private let MAA_TOOLS_VERSION = 5
 
 @MainActor final class MaaTools {
     public static let shared = MaaTools()
@@ -25,6 +25,7 @@ private let MAA_TOOLS_VERSION = 4
     private var scale = 1.0
     private var width = 0
     private var height = 0
+    private var didLogWindowMetrics = false
 
     // ['M', 'A', 'A', 0x00]
     private let connectionMagic = Data([0x4d, 0x41, 0x41, 0x00])
@@ -46,6 +47,8 @@ private let MAA_TOOLS_VERSION = 4
     private let rectMagic = Data([0x52, 0x45, 0x43, 0x54])
     // ['B', 'G', 'R', 0x01]
     private let bgrMagic = Data([0x42, 0x47, 0x52, 0x01])
+    // ['N', 'A', 'T', 'V']
+    private let nativeScreencapMagic = Data([0x4e, 0x41, 0x54, 0x56])
 
     func initialize() {
         guard PlaySettings.shared.maaTools else { return }
@@ -70,9 +73,24 @@ private let MAA_TOOLS_VERSION = 4
             scale = screen.nativeScale
             width = Int(screen.nativeBounds.width.rounded())
             height = Int(screen.nativeBounds.height.rounded())
+            logWindowMetrics(for: screen)
         }
 
         windowTitle = AKInterface.shared?.windowTitle
+    }
+
+    private func logWindowMetrics(for screen: UIScreen) {
+        guard !didLogWindowMetrics else { return }
+
+        didLogWindowMetrics = true
+        let bounds = format(screen.bounds)
+        let nativeBounds = format(screen.nativeBounds)
+        let frame = format(AKInterface.shared?.windowFrame ?? CGRect())
+        let content = format(AKInterface.shared?.windowContentRect ?? CGRect())
+        logger.debug("UIScreen.bounds \(bounds, privacy: .public)")
+        logger.debug("UIScreen.nativeBounds \(nativeBounds, privacy: .public)")
+        logger.debug("UIScreen.nativeScale \(screen.nativeScale, privacy: .public)")
+        logger.debug("NSWindow frame \(frame, privacy: .public), contentRect \(content, privacy: .public)")
     }
 
     private func startServer() {
@@ -148,6 +166,8 @@ private let MAA_TOOLS_VERSION = 4
                     try await rectangle(to: connection)
                 case bgrMagic:
                     try await bgrScreencap(to: connection)
+                case nativeScreencapMagic:
+                    try await nativeScreencap(to: connection)
                 default:
                     break
                 }
@@ -198,7 +218,8 @@ private let MAA_TOOLS_VERSION = 4
         }
 
         // Crop the title bar
-        let titleBarHeight = image.height - image.width * height / width
+        let expectedHeight = image.width * height / width
+        let titleBarHeight = max(0, image.height - expectedHeight)
         let contentRect = CGRect(x: 0, y: titleBarHeight, width: image.width,
                                  height: image.height - titleBarHeight)
         guard let image = image.cropping(to: contentRect) else {
@@ -344,18 +365,22 @@ private let MAA_TOOLS_VERSION = 4
 
         // Crop the title bar
         let expectedHeight = buffer.width * UInt(height) / UInt(width)
-        let titleBarHeight = buffer.height - expectedHeight
-        logger.debug("Cropping \(titleBarHeight) rows, expecting \(buffer.width)x\(expectedHeight)")
+        let contentHeight = min(buffer.height, expectedHeight)
+        let titleBarHeight = buffer.height - contentHeight
+        logger.debug("Cropping \(titleBarHeight) rows, expecting \(buffer.width)x\(contentHeight)")
+        logCaptureMetrics(imageWidth: image.width, imageHeight: image.height,
+                          contentWidth: Int(buffer.width), contentHeight: Int(contentHeight),
+                          titleBarHeight: Int(titleBarHeight))
 
         let offset = Int(titleBarHeight) * buffer.rowBytes
         var src = vImage_Buffer(data: buffer.data + offset,
-                                height: expectedHeight, width: buffer.width,
+                                height: contentHeight, width: buffer.width,
                                 rowBytes: buffer.rowBytes)
 
-        let bgrLength = Int(3 * expectedHeight * buffer.width)
+        let bgrLength = Int(3 * contentHeight * buffer.width)
         let bgrBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: bgrLength)
         var dst = vImage_Buffer(data: bgrBuffer,
-                                height: expectedHeight, width: buffer.width,
+                                height: contentHeight, width: buffer.width,
                                 rowBytes: 3 * Int(buffer.width))
 
         vImagePermuteChannels_ARGB8888(&src, &src, [2, 1, 0, 3], vImage_Flags(kvImageNoFlags))
@@ -365,13 +390,45 @@ private let MAA_TOOLS_VERSION = 4
             pointer.deallocate()
         })
 
-        return (Int(buffer.width), Int(expectedHeight), data)
+        return (Int(buffer.width), Int(contentHeight), data)
     }
 
     private func bgrScreencap(to connection: NWConnection) async throws {
         let (width, height, data) = bgrScreenshot() ?? (0, 0, Data())
         let payload = width.u32Bytes + height.u32Bytes + data.count.u32Bytes + data
         try await connection.send(content: payload)
+    }
+
+    private func nativeScreencap(to connection: NWConnection) async throws {
+        let (width, height, data) = bgrScreenshot() ?? (0, 0, Data())
+        var payload = Data()
+        payload.append(width.u32Bytes)
+        payload.append(height.u32Bytes)
+        payload.append(Data("BGR3".utf8))
+        payload.append(data.count.u32Bytes)
+        payload.append(data)
+        try await connection.send(content: payload)
+    }
+
+    private func logCaptureMetrics(imageWidth: Int,
+                                   imageHeight: Int,
+                                   contentWidth: Int,
+                                   contentHeight: Int,
+                                   titleBarHeight: Int) {
+        let frame = format(AKInterface.shared?.windowFrame ?? CGRect())
+        let content = format(AKInterface.shared?.windowContentRect ?? CGRect())
+        logger.debug("NSWindow frame \(frame, privacy: .public), contentRect \(content, privacy: .public)")
+        logger.debug(
+            "CGWindow \(imageWidth)x\(imageHeight), content \(contentWidth)x\(contentHeight), title \(titleBarHeight)"
+        )
+    }
+
+    private func format(_ rect: CGRect) -> String {
+        let x = Int(rect.origin.x.rounded())
+        let y = Int(rect.origin.y.rounded())
+        let width = Int(rect.size.width.rounded())
+        let height = Int(rect.size.height.rounded())
+        return "\(x),\(y) \(width)x\(height)"
     }
 }
 
