@@ -15,6 +15,24 @@ class Toucher {
     NSSearchPathForDirectoriesInDomains(.documentDirectory, .userDomainMask, true)[0] + "/toucher.log"
     static private var logCount = 0
     static var logFile: FileHandle?
+
+    private static func unityView(containing view: UIView?) -> UIView? {
+        var current = view
+        while let view = current {
+            let className = NSStringFromClass(type(of: view))
+            if className == "UnityView" || className.hasSuffix(".UnityView") {
+                return view
+            }
+            current = view.superview
+        }
+        return nil
+    }
+
+    private static func touchView(at point: CGPoint, in window: UIWindow?) -> UIView? {
+        let hitView = window?.hitTest(point, with: nil)
+        return unityView(containing: hitView) ?? hitView
+    }
+
     /**
      on invocations with phase "began", an int id is allocated, which can be used later to refer to this touch point.
      on invocations with phase "ended", id is set to nil representing the touch point is no longer valid.
@@ -28,7 +46,7 @@ class Toucher {
             }
             tid = -1
             keyWindow = screen.keyWindow
-            keyView = keyWindow!.hitTest(point, with: nil)
+            keyView = touchView(at: point, in: keyWindow)
         } else if tid == nil {
             return
         }
