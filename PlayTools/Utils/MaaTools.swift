@@ -18,12 +18,8 @@ private let TOUCH_SYNC_TIMEOUT: TimeInterval = 3
     private let logger = Logger(subsystem: "PlayTools", category: "MaaTools")
     private let queue = DispatchQueue(label: "MaaTools", qos: .default)
     private var listener: NWListener?
-    private var activeConnection: NWConnection?
-    private var activeConnectionDidTouch = false
 
     private var windowTitle: String?
-    private var tid: Int?
-    private var lastTouchPoint: CGPoint?
 
     private var scale = 1.0
     private var width = 0
@@ -101,7 +97,14 @@ private let TOUCH_SYNC_TIMEOUT: TimeInterval = 3
 
     private func startServer() {
         let port = NWEndpoint.Port(rawValue: UInt16(PlaySettings.shared.maaToolsPort & 0xffff)) ?? .any
-        listener = try? NWListener(using: .tcp, on: port)
+        let tcpOptions = NWProtocolTCP.Options()
+        // Release per-connection touch state when a peer disappears without closing its socket.
+        tcpOptions.enableKeepalive = true
+        tcpOptions.keepaliveIdle = 10
+        tcpOptions.keepaliveInterval = 5
+        tcpOptions.keepaliveCount = 3
+        let parameters = NWParameters(tls: nil, tcp: tcpOptions)
+        listener = try? NWListener(using: parameters, on: port)
 
         listener?.newConnectionHandler = { [weak self] newConnection in
             guard let strongSelf = self else { return }
@@ -136,15 +139,9 @@ private let TOUCH_SYNC_TIMEOUT: TimeInterval = 3
     // swiftlint:disable cyclomatic_complexity
 
     private func handleConnection(_ connection: NWConnection) async {
-        var ownsTouchState = false
+        let touchState = MaaToolsTouchState()
         defer {
-            if ownsTouchState && activeConnection === connection {
-                if activeConnectionDidTouch {
-                    resetTouch()
-                }
-                activeConnectionDidTouch = false
-                activeConnection = nil
-            }
+            resetTouch(in: touchState)
             connection.cancel()
         }
 
@@ -156,16 +153,9 @@ private let TOUCH_SYNC_TIMEOUT: TimeInterval = 3
             guard handshake == connectionMagic else {
                 throw MaaToolsError.invalidMessage
             }
-            guard activeConnection == nil else {
-                logger.warning("Rejected a second MaaTools client")
-                return
-            }
 
-            activeConnection = connection
-            activeConnectionDidTouch = false
-            ownsTouchState = true
             try await connection.send(content: "OKAY".data(using: .ascii))
-            try await handleMessages(on: connection)
+            try await handleMessages(on: connection, touchState: touchState)
         } catch MaaToolsError.connectionClosed {
             logger.debug("Client disconnected")
         } catch {
@@ -173,7 +163,7 @@ private let TOUCH_SYNC_TIMEOUT: TimeInterval = 3
         }
     }
 
-    private func handleMessages(on connection: NWConnection) async throws {
+    private func handleMessages(on connection: NWConnection, touchState: MaaToolsTouchState) async throws {
         for try await payload in readPayload(from: connection) {
             switch payload.prefix(4) {
             case screencapMagic:
@@ -183,7 +173,7 @@ private let TOUCH_SYNC_TIMEOUT: TimeInterval = 3
             case terminateMagic:
                 AKInterface.shared?.terminateApplication()
             case toucherMagic:
-                toucherDispatch(payload, on: connection)
+                toucherDispatch(payload, touchState: touchState)
             case toucherSyncMagic:
                 try await toucherSync(to: connection)
             case versionMagic:
@@ -275,10 +265,9 @@ private let TOUCH_SYNC_TIMEOUT: TimeInterval = 3
         try await connection.send(content: width.u16Bytes + height.u16Bytes)
     }
 
-    private func toucherDispatch(_ content: Data, on _: NWConnection) {
+    private func toucherDispatch(_ content: Data, touchState: MaaToolsTouchState) {
         guard content.count >= 9 else { return }
         setupWindow()
-        activeConnectionDidTouch = true
 
         let touchPhase = content[4]
 
@@ -287,52 +276,50 @@ private let TOUCH_SYNC_TIMEOUT: TimeInterval = 3
 
         switch touchPhase {
         case 0:
-            toucherDown(atX: pointX, atY: pointY)
+            toucherDown(atX: pointX, atY: pointY, touchState: touchState)
         case 1:
-            toucherMove(atX: pointX, atY: pointY)
+            toucherMove(atX: pointX, atY: pointY, touchState: touchState)
         case 3:
-            toucherUp(atX: pointX, atY: pointY)
-            Toucher.keyView = nil
+            toucherUp(atX: pointX, atY: pointY, touchState: touchState)
         default:
             break
         }
     }
 
-    private func toucherDown(atX: Int, atY: Int) {
-        resetTouch()
+    private func toucherDown(atX: Int, atY: Int, touchState: MaaToolsTouchState) {
+        resetTouch(in: touchState)
 
         let point = CGPoint(x: atX, y: atY)
-        lastTouchPoint = point
-        Toucher.touchcam(point: point, phase: .began, tid: &tid,
+        touchState.lastTouchPoint = point
+        Toucher.touchcam(point: point, phase: .began, context: touchState.context,
                          actionName: "down", keyName: "touch")
     }
 
-    private func toucherMove(atX: Int, atY: Int) {
+    private func toucherMove(atX: Int, atY: Int, touchState: MaaToolsTouchState) {
         let point = CGPoint(x: atX, y: atY)
-        lastTouchPoint = point
-        Toucher.touchcam(point: point, phase: .moved, tid: &tid,
+        touchState.lastTouchPoint = point
+        Toucher.touchcam(point: point, phase: .moved, context: touchState.context,
                          actionName: "move", keyName: "touch")
     }
 
-    private func toucherUp(atX: Int, atY: Int) {
+    private func toucherUp(atX: Int, atY: Int, touchState: MaaToolsTouchState) {
         let point = CGPoint(x: atX, y: atY)
-        lastTouchPoint = point
-        Toucher.touchcam(point: point, phase: .ended, tid: &tid,
+        touchState.lastTouchPoint = point
+        Toucher.touchcam(point: point, phase: .ended, context: touchState.context,
                          actionName: "up", keyName: "touch")
-        lastTouchPoint = nil
+        touchState.lastTouchPoint = nil
     }
 
-    private func resetTouch() {
-        guard tid != nil else {
-            Toucher.keyView = nil
-            lastTouchPoint = nil
+    private func resetTouch(in touchState: MaaToolsTouchState) {
+        guard touchState.context.isActive else {
+            touchState.lastTouchPoint = nil
             return
         }
 
-        Toucher.touchcam(point: lastTouchPoint ?? .zero, phase: .cancelled, tid: &tid,
+        Toucher.touchcam(point: touchState.lastTouchPoint ?? .zero, phase: .cancelled,
+                         context: touchState.context,
                          actionName: "cancel", keyName: "touch")
-        Toucher.keyView = nil
-        lastTouchPoint = nil
+        touchState.lastTouchPoint = nil
     }
 
     nonisolated private func toucherSync(to connection: NWConnection) async throws {
@@ -471,6 +458,11 @@ private let TOUCH_SYNC_TIMEOUT: TimeInterval = 3
         let height = Int(rect.size.height.rounded())
         return "\(x),\(y) \(width)x\(height)"
     }
+}
+
+private final class MaaToolsTouchState {
+    let context = Toucher.TouchContext()
+    var lastTouchPoint: CGPoint?
 }
 
 private enum MaaToolsError: Error {

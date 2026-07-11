@@ -7,6 +7,16 @@ import Foundation
 import UIKit
 
 class Toucher {
+    final class TouchContext {
+        fileprivate var tid: Int?
+        fileprivate weak var keyWindow: UIWindow?
+        fileprivate weak var keyView: UIView?
+
+        var isActive: Bool {
+            tid != nil
+        }
+    }
+
     static weak var keyWindow: UIWindow?
     static weak var keyView: UIView?
     // For debug only
@@ -40,13 +50,39 @@ class Toucher {
     static func touchcam(point: CGPoint, phase: UITouch.Phase, tid: inout Int?,
                          // Name info for debug use
                          actionName: String, keyName: String) {
+        if phase == UITouch.Phase.began && tid == nil {
+            keyWindow = screen.keyWindow
+            keyView = touchView(at: point, in: keyWindow)
+        }
+        dispatchTouch(point: point, phase: phase, tid: &tid,
+                      keyWindow: keyWindow, keyView: keyView,
+                      actionName: actionName, keyName: keyName)
+    }
+
+    static func touchcam(point: CGPoint, phase: UITouch.Phase, context: TouchContext,
+                         // Name info for debug use
+                         actionName: String, keyName: String) {
+        if phase == UITouch.Phase.began && !context.isActive {
+            context.keyWindow = screen.keyWindow
+            context.keyView = touchView(at: point, in: context.keyWindow)
+        }
+        dispatchTouch(point: point, phase: phase, tid: &context.tid,
+                      keyWindow: context.keyWindow, keyView: context.keyView,
+                      actionName: actionName, keyName: keyName)
+        if !context.isActive {
+            context.keyWindow = nil
+            context.keyView = nil
+        }
+    }
+
+    private static func dispatchTouch(point: CGPoint, phase: UITouch.Phase, tid: inout Int?,
+                                      keyWindow: UIWindow?, keyView: UIView?,
+                                      actionName: String, keyName: String) {
         if phase == UITouch.Phase.began {
             if tid != nil {
                 return
             }
             tid = -1
-            keyWindow = screen.keyWindow
-            keyView = touchView(at: point, in: keyWindow)
         } else if tid == nil {
             return
         }
