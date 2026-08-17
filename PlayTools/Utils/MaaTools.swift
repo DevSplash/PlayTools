@@ -25,6 +25,7 @@ private let TOUCH_SYNC_TIMEOUT: TimeInterval = 3
     private var width = 0
     private var height = 0
     private var lastWindowMetrics: String?
+    private var lastScrnResampleWarning: String?
 
     // ['M', 'A', 'A', 0x00]
     private let connectionMagic = Data([0x4d, 0x41, 0x41, 0x00])
@@ -89,10 +90,14 @@ private let TOUCH_SYNC_TIMEOUT: TimeInterval = 3
         guard lastWindowMetrics != metrics else { return }
 
         lastWindowMetrics = metrics
+        let backing = PlayScreen.shared.nsWindow?
+            .value(forKey: "backingScaleFactor") as? NSNumber
         logger.debug("UIScreen.bounds \(bounds, privacy: .public)")
         logger.debug("UIScreen.nativeBounds \(nativeBounds, privacy: .public)")
         logger.debug("UIScreen.nativeScale \(screen.nativeScale, privacy: .public)")
         logger.debug("NSWindow frame \(frame, privacy: .public), contentRect \(content, privacy: .public)")
+        logger.debug("NSWindow.backingScaleFactor \(backing?.doubleValue ?? 0, privacy: .public)")
+        logger.debug("macOSNativeScaling \(PlaySettings.shared.macOSNativeScaling)")
     }
 
     private func startServer() {
@@ -238,6 +243,15 @@ private let TOUCH_SYNC_TIMEOUT: TimeInterval = 3
         // Crop the title bar
         let expectedHeight = image.width * height / width
         let titleBarHeight = max(0, image.height - expectedHeight)
+        let sourceWidth = image.width
+        let sourceHeight = image.height - titleBarHeight
+        if sourceWidth != width || sourceHeight != height {
+            let key = "\(sourceWidth)x\(sourceHeight)->\(width)x\(height)"
+            if lastScrnResampleWarning != key {
+                lastScrnResampleWarning = key
+                logger.warning("SCRN resampling \(key, privacy: .public)")
+            }
+        }
         let contentRect = CGRect(x: 0, y: titleBarHeight, width: image.width,
                                  height: image.height - titleBarHeight)
         guard let image = image.cropping(to: contentRect) else {
@@ -396,6 +410,7 @@ private let TOUCH_SYNC_TIMEOUT: TimeInterval = 3
         let contentHeight = min(buffer.height, expectedHeight)
         let titleBarHeight = buffer.height - contentHeight
         logger.debug("Cropping \(titleBarHeight) rows, expecting \(buffer.width)x\(contentHeight)")
+        logger.debug("NATV/BGR \(buffer.width)x\(contentHeight)")
         logCaptureMetrics(imageWidth: image.width, imageHeight: image.height,
                           contentWidth: Int(buffer.width), contentHeight: Int(contentHeight),
                           titleBarHeight: Int(titleBarHeight))

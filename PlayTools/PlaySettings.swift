@@ -106,6 +106,8 @@ enum ContentScaleCompensationMode: Int, Codable, Hashable {
 
     @objc lazy var windowFixMethod = settingsData.windowFixMethod
 
+    @objc lazy var macOSNativeScaling = settingsData.usesMacOSNativeScaling
+
     @objc lazy var customScaler = settingsData.effectiveCustomScaler
 
     @objc lazy var rootWorkDir = settingsData.rootWorkDir
@@ -145,6 +147,7 @@ struct AppSettingsData: Codable {
     var targetWindowHeight: Int?
     var contentScaleCompensationMode: ContentScaleCompensationMode?
     var contentScaleCompensationValue: Double?
+    var macOSNativeScaling: Bool?
     var aspectRatio = 1
     var displayRotation = 0
     var notch = false
@@ -171,15 +174,28 @@ struct AppSettingsData: Codable {
     var blockSleepSpamming = false
     var ignoreUnityKeyboardInitializationError = false
 
+    var usesMacOSNativeScaling: Bool {
+        macOSNativeScaling == true
+    }
+
     var compensatedWindowWidth: Int {
-        compensatedResolution(targetWindowWidth ?? windowWidth)
+        if usesMacOSNativeScaling {
+            return targetWindowWidth ?? windowWidth
+        }
+        return compensatedResolution(targetWindowWidth ?? windowWidth)
     }
 
     var compensatedWindowHeight: Int {
-        compensatedResolution(targetWindowHeight ?? windowHeight)
+        if usesMacOSNativeScaling {
+            return targetWindowHeight ?? windowHeight
+        }
+        return compensatedResolution(targetWindowHeight ?? windowHeight)
     }
 
     var effectiveCustomScaler: Double {
+        if usesMacOSNativeScaling {
+            return 1.0
+        }
         guard contentScaleCompensationActive else {
             return customScaler
         }
@@ -199,7 +215,10 @@ struct AppSettingsData: Codable {
     }
 
     private var contentScaleCompensationActive: Bool {
-        resolution != 0 && resolution != 6 && (contentScaleCompensationMode ?? .disabled) != .disabled
+        !usesMacOSNativeScaling &&
+            resolution != 0 &&
+            resolution != 6 &&
+            (contentScaleCompensationMode ?? .disabled) != .disabled
     }
 
     private var contentScaleCompensationScale: Double {

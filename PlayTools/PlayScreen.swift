@@ -3,6 +3,7 @@
 //  PlayTools
 //
 import Foundation
+import OSLog
 import UIKit
 
 let screen = PlayScreen.shared
@@ -86,6 +87,9 @@ public class PlayScreen: NSObject {
     @objc public static let shared = PlayScreen()
 
     func initialize() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            PlayScreen.logDisplayMetrics()
+        }
         if resizable {
             // Remove default size restrictions
             NotificationCenter.default.addObserver(forName: UIWindow.didBecomeKeyNotification, object: nil,
@@ -199,6 +203,28 @@ public class PlayScreen: NSObject {
     }
     @objc public static func frameInternalDefault(_ rect: CGRect) -> CGRect {
             return rect.toAspectRatioDefault()
+    }
+
+    static func logDisplayMetrics() {
+        let logger = Logger(subsystem: "PlayTools", category: "NativeScaling")
+        let screen = UIScreen.main
+        let bounds = format(screen.bounds)
+        let nativeBounds = format(screen.nativeBounds)
+        let content = format(AKInterface.shared?.windowContentRect ?? .zero)
+        let backing = PlayScreen.shared.nsWindow?
+            .value(forKey: "backingScaleFactor") as? NSNumber
+        logger.debug("UIScreen.bounds \(bounds, privacy: .public)")
+        logger.debug("UIScreen.nativeBounds \(nativeBounds, privacy: .public)")
+        logger.debug("UIScreen.nativeScale \(screen.nativeScale, privacy: .public)")
+        logger.debug("NSWindow contentRect \(content, privacy: .public)")
+        logger.debug("NSWindow.backingScaleFactor \(backing?.doubleValue ?? 0, privacy: .public)")
+        logger.debug("macOSNativeScaling \(PlaySettings.shared.macOSNativeScaling)")
+    }
+
+    private static func format(_ rect: CGRect) -> String {
+        let width = Int(rect.size.width.rounded())
+        let height = Int(rect.size.height.rounded())
+        return "\(width)x\(height)"
     }
 
     private static weak var cachedWindow: UIWindow?

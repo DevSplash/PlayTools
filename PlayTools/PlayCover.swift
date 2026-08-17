@@ -4,6 +4,7 @@
 //
 
 import Foundation
+import OSLog
 import UIKit
 
 public class PlayCover: NSObject {
@@ -17,6 +18,7 @@ public class PlayCover: NSObject {
         PlayScreen.shared.initialize()
         PlayInput.shared.initialize()
         DiscordIPC.shared.initialize()
+        logNativeScaling()
 
         DispatchQueue.main.async {
             MaaTools.shared.initialize()
@@ -103,6 +105,16 @@ public class PlayCover: NSObject {
                 // This actually happens for ToF. Hope future developers can solve this.
             }
         }
+    }
+
+    private static func logNativeScaling() {
+        let logger = Logger(subsystem: "PlayTools", category: "NativeScaling")
+        let settings = PlaySettings.shared
+        let enabled = settings.macOSNativeScaling
+        let width = Int(settings.windowSizeWidth)
+        let height = Int(settings.windowSizeHeight)
+        logger.log("bundle=\(settings.bundleIdentifier, privacy: .public)")
+        logger.log("nativeScaling=\(enabled) window=\(width)x\(height) scaler=\(settings.customScaler)")
     }
 
     static func delay(_ delay: Double, closure: @escaping () -> Void) {
