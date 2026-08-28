@@ -11,6 +11,19 @@ import OSLog
 
 private let MAA_TOOLS_VERSION = 5
 private let TOUCH_SYNC_TIMEOUT: TimeInterval = 3
+// One shared allowance for delivery/scheduling overhead, not one allowance per event.
+private let TOUCH_SEQUENCE_DELIVERY_SLACK: TimeInterval = 3
+// TSEQ event: u32 delay-after-previous-event (microseconds), u8 phase, u16 x, u16 y; all big-endian.
+private let TOUCH_SEQUENCE_HEADER_LENGTH = 6
+private let TOUCH_SEQUENCE_EVENT_LENGTH = 9
+private let MAX_TOUCH_SEQUENCE_EVENTS = 1024
+private let MAX_TOUCH_SEQUENCE_EVENT_DELAY_US: UInt32 = 30_000_000
+private let MAX_TOUCH_SEQUENCE_DURATION_US: UInt64 = 120_000_000
+private let MIN_MAA_TOOLS_PAYLOAD_LENGTH = 4
+private let MAX_MAA_TOOLS_PAYLOAD_LENGTH = TOUCH_SEQUENCE_HEADER_LENGTH
+    + MAX_TOUCH_SEQUENCE_EVENTS * TOUCH_SEQUENCE_EVENT_LENGTH
+// Bounds queued payload bytes to roughly 2.25 MiB in the worst case, excluding Data overhead.
+private let MAX_BUFFERED_MAA_TOOLS_MESSAGES = 256
 
 @MainActor final class MaaTools {
     public static let shared = MaaTools()
@@ -39,6 +52,8 @@ private let TOUCH_SYNC_TIMEOUT: TimeInterval = 3
     private let toucherMagic = Data([0x54, 0x55, 0x43, 0x48])
     // ['T', 'S', 'Y', 'N']
     private let toucherSyncMagic = Data([0x54, 0x53, 0x59, 0x4e])
+    // ['T', 'S', 'E', 'Q']
+    private let touchSequenceMagic = Data([0x54, 0x53, 0x45, 0x51])
     // ['V', 'E', 'R', 'N']
     private let versionMagic = Data([0x56, 0x45, 0x52, 0x4e])
     // ['B', 'N', 'D', 'L']
@@ -169,7 +184,8 @@ private let TOUCH_SYNC_TIMEOUT: TimeInterval = 3
     }
 
     private func handleMessages(on connection: NWConnection, touchState: MaaToolsTouchState) async throws {
-        for try await payload in readPayload(from: connection) {
+        for try await payload in readPayload(from: connection, touchState: touchState) {
+            guard !touchState.connectionClosed else { throw MaaToolsError.connectionClosed }
             switch payload.prefix(4) {
             case screencapMagic:
                 try await screencap(to: connection)
@@ -181,6 +197,8 @@ private let TOUCH_SYNC_TIMEOUT: TimeInterval = 3
                 toucherDispatch(payload, touchState: touchState)
             case toucherSyncMagic:
                 try await toucherSync(to: connection)
+            case touchSequenceMagic:
+                try await touchSequence(payload, to: connection, touchState: touchState)
             case versionMagic:
                 try await version(to: connection)
             case bundleMagic:
@@ -201,19 +219,36 @@ private let TOUCH_SYNC_TIMEOUT: TimeInterval = 3
 
     // swiftlint:disable line_length
 
-    private func readPayload(from connection: NWConnection) -> AsyncThrowingStream<Data, Error> {
-        AsyncThrowingStream { continuation in
-            let receiver = Task {
+    private func readPayload(from connection: NWConnection,
+                             touchState: MaaToolsTouchState) -> AsyncThrowingStream<Data, Error> {
+        AsyncThrowingStream(bufferingPolicy: .bufferingOldest(MAX_BUFFERED_MAA_TOOLS_MESSAGES)) { continuation in
+            let receiver = Task { [weak self] in
                 while true {
                     do {
                         try Task.checkCancellation()
                         let (header, _, _) = try await connection.receive(minimumIncompleteLength: 2, maximumLength: 2)
+                        guard header.count == 2 else { throw MaaToolsError.invalidFrameLength }
                         let length = header.u16(at: 0)
+                        guard (MIN_MAA_TOOLS_PAYLOAD_LENGTH ... MAX_MAA_TOOLS_PAYLOAD_LENGTH).contains(length) else {
+                            throw MaaToolsError.invalidFrameLength
+                        }
 
                         try Task.checkCancellation()
                         let (payload, _, _) = try await connection.receive(minimumIncompleteLength: length, maximumLength: length)
-                        continuation.yield(payload)
+                        guard payload.count == length else { throw MaaToolsError.invalidFrameLength }
+                        switch continuation.yield(payload) {
+                        case .enqueued:
+                            break
+                        case .dropped:
+                            throw MaaToolsError.receiveBufferOverflow
+                        case .terminated:
+                            throw MaaToolsError.connectionClosed
+                        @unknown default:
+                            throw MaaToolsError.invalidMessage
+                        }
                     } catch {
+                        self?.connectionDidClose(touchState)
+                        connection.cancel()
                         continuation.finish(throwing: error)
                         break
                     }
@@ -280,48 +315,157 @@ private let TOUCH_SYNC_TIMEOUT: TimeInterval = 3
     }
 
     private func toucherDispatch(_ content: Data, touchState: MaaToolsTouchState) {
-        guard content.count >= 9 else { return }
+        guard let event = touchEvent(in: content, at: 4, delayMicroseconds: 0) else { return }
         setupWindow()
+        dispatchTouch(event, touchState: touchState)
+    }
 
-        let touchPhase = content[4]
+    private func touchSequence(_ content: Data,
+                               to connection: NWConnection,
+                               touchState: MaaToolsTouchState) async throws {
+        guard let events = touchSequenceEvents(from: content) else {
+            resetTouch(in: touchState)
+            _ = await syncPendingTouchEvents()
+            try await sendTouchResponse(false, to: connection)
+            return
+        }
 
-        let pointX = content.u16(at: 5).divRound(by: scale)
-        let pointY = content.u16(at: 7).divRound(by: scale)
+        let sequenceTask = Task { @MainActor in
+            try await self.executeTouchSequence(events, touchState: touchState)
+        }
+        touchState.beginSequence(sequenceTask)
+        defer { touchState.endSequence() }
 
-        switch touchPhase {
-        case 0:
-            toucherDown(atX: pointX, atY: pointY, touchState: touchState)
-        case 1:
-            toucherMove(atX: pointX, atY: pointY, touchState: touchState)
-        case 3:
-            toucherUp(atX: pointX, atY: pointY, touchState: touchState)
-        default:
-            break
+        do {
+            try await withTaskCancellationHandler {
+                try await sequenceTask.value
+            } onCancel: {
+                sequenceTask.cancel()
+            }
+            try Task.checkCancellation()
+        } catch {
+            resetTouch(in: touchState)
+            if touchState.connectionClosed {
+                throw MaaToolsError.connectionClosed
+            }
+            _ = await syncPendingTouchEvents()
+            try await sendTouchResponse(false, to: connection)
+            return
+        }
+
+        guard !touchState.connectionClosed else {
+            throw MaaToolsError.connectionClosed
+        }
+        // The final event's delivery barrier has already synchronized the entire sequence.
+        try await sendTouchResponse(true, to: connection)
+    }
+
+    private func executeTouchSequence(_ events: [MaaToolsTouchEvent],
+                                      touchState: MaaToolsTouchState) async throws {
+        let delayNanoseconds = events.reduce(UInt64(0)) { $0 + UInt64($1.delayMicroseconds) * 1_000 }
+        var previousDispatchTime = DispatchTime.now().uptimeNanoseconds
+        let deadline = previousDispatchTime + delayNanoseconds
+            + UInt64(TOUCH_SEQUENCE_DELIVERY_SLACK * 1_000_000_000)
+
+        for event in events {
+            try Task.checkCancellation()
+            let due = previousDispatchTime + UInt64(event.delayMicroseconds) * 1_000
+            let now = DispatchTime.now().uptimeNanoseconds
+            guard due < deadline, now < deadline else { throw MaaToolsError.touchSequenceTimedOut }
+            // Delivery wait time counts toward the next relative delay, rather than being added to it.
+            if due > now {
+                try await Task.sleep(nanoseconds: due - now)
+            }
+            try Task.checkCancellation()
+            let dispatchedAt = DispatchTime.now().uptimeNanoseconds
+            guard dispatchedAt < deadline else { throw MaaToolsError.touchSequenceTimedOut }
+            previousDispatchTime = dispatchedAt
+            dispatchTouch(event, touchState: touchState)
+
+            // PTFakeMetaTouch stores mutable UITouch state. Do not overwrite it until sendEvent returns.
+            let delivered = await syncPendingTouchEvents(until: deadline)
+            try Task.checkCancellation()
+            guard delivered else { throw MaaToolsError.touchDeliveryFailed }
+            guard DispatchTime.now().uptimeNanoseconds < deadline else {
+                throw MaaToolsError.touchSequenceTimedOut
+            }
         }
     }
 
-    private func toucherDown(atX: Int, atY: Int, touchState: MaaToolsTouchState) {
-        resetTouch(in: touchState)
+    private func touchSequenceEvents(from content: Data) -> [MaaToolsTouchEvent]? {
+        setupWindow()
+        guard content.count >= TOUCH_SEQUENCE_HEADER_LENGTH else { return nil }
 
-        let point = CGPoint(x: atX, y: atY)
-        touchState.lastTouchPoint = point
-        Toucher.touchcam(point: point, phase: .began, context: touchState.context,
-                         actionName: "down", keyName: "touch")
+        let eventCount = content.u16(at: 4)
+        guard (1 ... MAX_TOUCH_SEQUENCE_EVENTS).contains(eventCount),
+              content.count == TOUCH_SEQUENCE_HEADER_LENGTH + eventCount * TOUCH_SEQUENCE_EVENT_LENGTH,
+              width > 0, height > 0 else {
+            return nil
+        }
+
+        var events = [MaaToolsTouchEvent]()
+        events.reserveCapacity(eventCount)
+        var totalDuration: UInt64 = 0
+        var sequenceTouchIsActive = false
+
+        for eventIndex in 0..<eventCount {
+            let eventOffset = TOUCH_SEQUENCE_HEADER_LENGTH + eventIndex * TOUCH_SEQUENCE_EVENT_LENGTH
+            let delayMicroseconds = content.u32(at: eventOffset)
+            let nextDuration = totalDuration + UInt64(delayMicroseconds)
+            guard delayMicroseconds <= MAX_TOUCH_SEQUENCE_EVENT_DELAY_US,
+                  nextDuration <= MAX_TOUCH_SEQUENCE_DURATION_US,
+                  let event = touchEvent(in: content, at: eventOffset + 4,
+                                         delayMicroseconds: delayMicroseconds),
+                  (0..<width).contains(event.x),
+                  (0..<height).contains(event.y) else {
+                return nil
+            }
+
+            switch (sequenceTouchIsActive, event.phase) {
+            case (false, .down):
+                sequenceTouchIsActive = true
+            case (true, .move):
+                break
+            case (true, .up):
+                sequenceTouchIsActive = false
+            default:
+                return nil
+            }
+
+            events.append(event)
+            totalDuration = nextDuration
+        }
+
+        guard !sequenceTouchIsActive else { return nil }
+        return events
     }
 
-    private func toucherMove(atX: Int, atY: Int, touchState: MaaToolsTouchState) {
-        let point = CGPoint(x: atX, y: atY)
-        touchState.lastTouchPoint = point
-        Toucher.touchcam(point: point, phase: .moved, context: touchState.context,
-                         actionName: "move", keyName: "touch")
+    private func touchEvent(in content: Data,
+                            at offset: Int,
+                            delayMicroseconds: UInt32) -> MaaToolsTouchEvent? {
+        guard offset >= 0, offset + 5 <= content.count,
+              let phase = MaaToolsTouchPhase(rawValue: content[offset]) else {
+            return nil
+        }
+        return MaaToolsTouchEvent(delayMicroseconds: delayMicroseconds,
+                                  phase: phase,
+                                  x: content.u16(at: offset + 1),
+                                  y: content.u16(at: offset + 3))
     }
 
-    private func toucherUp(atX: Int, atY: Int, touchState: MaaToolsTouchState) {
-        let point = CGPoint(x: atX, y: atY)
+    private func dispatchTouch(_ event: MaaToolsTouchEvent, touchState: MaaToolsTouchState) {
+        if event.phase == .down {
+            resetTouch(in: touchState)
+        }
+
+        let point = CGPoint(x: event.x.divRound(by: scale),
+                            y: event.y.divRound(by: scale))
         touchState.lastTouchPoint = point
-        Toucher.touchcam(point: point, phase: .ended, context: touchState.context,
-                         actionName: "up", keyName: "touch")
-        touchState.lastTouchPoint = nil
+        Toucher.touchcam(point: point, phase: event.phase.uiPhase, context: touchState.context,
+                         actionName: event.phase.actionName, keyName: "touch")
+        if event.phase == .up {
+            touchState.lastTouchPoint = nil
+        }
     }
 
     private func resetTouch(in touchState: MaaToolsTouchState) {
@@ -336,22 +480,36 @@ private let TOUCH_SYNC_TIMEOUT: TimeInterval = 3
         touchState.lastTouchPoint = nil
     }
 
+    private func connectionDidClose(_ touchState: MaaToolsTouchState) {
+        touchState.connectionDidClose()
+        resetTouch(in: touchState)
+    }
+
     nonisolated private func toucherSync(to connection: NWConnection) async throws {
-        let _: Bool = try await withCheckedThrowingContinuation { continuation in
-            PTFakeMetaTouch.syncPendingEvents(timeout: TOUCH_SYNC_TIMEOUT) { delivered in
-                let response = delivered ? "OKAY" : "FAIL"
-                connection.send(
-                    content: response.data(using: .ascii),
-                    completion: .contentProcessed { error in
-                        if let error {
-                            continuation.resume(throwing: error)
-                        } else {
-                            continuation.resume(returning: delivered)
-                        }
-                    }
-                )
+        let delivered = await syncPendingTouchEvents()
+        try await sendTouchResponse(delivered, to: connection)
+    }
+
+    nonisolated private func syncPendingTouchEvents(until deadline: UInt64? = nil) async -> Bool {
+        var timeout = TOUCH_SYNC_TIMEOUT
+        if let deadline {
+            // Recompute on this executor immediately before registering the barrier.
+            let now = DispatchTime.now().uptimeNanoseconds
+            guard now < deadline else { return false }
+            let remaining = Double(deadline - now) / 1_000_000_000
+            timeout = min(timeout, remaining)
+        }
+        return await withCheckedContinuation { continuation in
+            PTFakeMetaTouch.syncPendingEvents(timeout: timeout) { delivered in
+                continuation.resume(returning: delivered)
             }
         }
+    }
+
+    nonisolated private func sendTouchResponse(_ delivered: Bool,
+                                               to connection: NWConnection) async throws {
+        let response = delivered ? "OKAY" : "FAIL"
+        try await connection.send(content: response.data(using: .ascii))
     }
 
     private func version(to connection: NWConnection) async throws {
@@ -475,15 +633,72 @@ private let TOUCH_SYNC_TIMEOUT: TimeInterval = 3
     }
 }
 
-private final class MaaToolsTouchState {
+private struct MaaToolsTouchEvent {
+    let delayMicroseconds: UInt32
+    let phase: MaaToolsTouchPhase
+    let x: Int
+    let y: Int
+}
+
+private enum MaaToolsTouchPhase: UInt8 {
+    case down = 0
+    case move = 1
+    case up = 3
+
+    var uiPhase: UITouch.Phase {
+        switch self {
+        case .down:
+            return .began
+        case .move:
+            return .moved
+        case .up:
+            return .ended
+        }
+    }
+
+    var actionName: String {
+        switch self {
+        case .down:
+            return "down"
+        case .move:
+            return "move"
+        case .up:
+            return "up"
+        }
+    }
+}
+
+@MainActor private final class MaaToolsTouchState {
     let context = Toucher.TouchContext()
     var lastTouchPoint: CGPoint?
+    private var activeSequenceTask: Task<Void, Error>?
+    private(set) var connectionClosed = false
+
+    func beginSequence(_ task: Task<Void, Error>) {
+        activeSequenceTask = task
+        if connectionClosed {
+            task.cancel()
+        }
+    }
+
+    func endSequence() {
+        activeSequenceTask = nil
+    }
+
+    func connectionDidClose() {
+        connectionClosed = true
+        activeSequenceTask?.cancel()
+    }
 }
 
 private enum MaaToolsError: Error {
     case connectionClosed
     case emptyContent
+    case invalidFrameLength
     case invalidMessage
+    case receiveBufferOverflow
+    case touchDeliveryFailed
+    case touchSequenceTimedOut
 }
 
 private extension Int {
@@ -507,6 +722,14 @@ private extension Data {
     func u16(at offset: Int) -> Int {
         guard offset < count - 1 else { return 0 }
         return Int(self[offset]) * 256 + Int(self[offset + 1])
+    }
+
+    func u32(at offset: Int) -> UInt32 {
+        guard offset < count - 3 else { return 0 }
+        return UInt32(self[offset]) << 24
+            | UInt32(self[offset + 1]) << 16
+            | UInt32(self[offset + 2]) << 8
+            | UInt32(self[offset + 3])
     }
 }
 

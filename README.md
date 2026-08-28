@@ -2,6 +2,9 @@
 
 PlayTools is an essential part of [PlayCover](https://github.com/PlayCover/PlayCover). PlayTools implements core functions of PlayCover, including display control, key mapping and bypassing.
 
+The [MaaTools v5 protocol](#maatools-protocol-v5) documents automation touch
+sequences, delivery guarantees, timeouts, compatibility, and verification limits.
+
 ## Display Control
 
 <!-- iOS APPs running on macOS usually have fixed display settings, which may not be suitable for the user's needs. PlayTools allows you to adjust the display settings of the game, so that you can enjoy the game in a more comfortable way. -->
@@ -177,4 +180,202 @@ A bridge that encapsulates native macOS APIs to expose an interface for PlayTool
 Localizations for PlayTools are tricky. As PlayTools runs as a dynamic library inside the game, localizable strings must be copied into the game to take effect. This is done during IPA installation and every launch of the game through PlayCover.
 
 To avoid conflicting with the game's own localizable strings, PlayTools' localizable strings are renamed to `PlayTools.strings`, instead of the default `Localizable.strings`.
+
+# MaaTools protocol v5
+
+This document specifies the MaaTools protocol implemented by PlayTools. Clients
+may send `TSEQ` only after `VERN >= 5`; no `CAPS` negotiation is used. Existing
+`TUCH`, `TSYN`, `SCRN`, `BGR\x01`, `NATV`, `SIZE`, `BNDL`, `RECT`, and `TERM`
+commands remain available. Screenshot formats and window-scaling behavior are
+unchanged.
+
+## Connection and framing
+
+1. Connect using TCP and send the four unframed bytes `4d 41 41 00` (`MAA\0`).
+2. Read the four unframed bytes `4f 4b 41 59` (`OKAY`).
+3. Each subsequent request is `u16be payloadLength` followed by exactly that many
+   payload bytes, including its four-byte command identifier. The length prefix
+   does not include itself. Responses do not use this request-length prefix.
+
+Payload lengths must be in `4...9222`. Invalid lengths, incomplete frames, and
+transport errors close the connection and cancel its active touch. At most 256
+complete messages can wait in the receive buffer (up to 2.25 MiB of payload bytes,
+excluding allocation overhead). Overflow closes the connection; buffered commands
+are not executed after closure.
+
+Commands execute in receive order on each connection. A running `TSEQ` must finish
+or fail before the next command on that connection executes. Other connections
+have independent touch contexts and sequence tasks.
+
+| Request payload | Response |
+| --- | --- |
+| `VERN` | `u32be version`; v5 returns `00 00 00 05` |
+| `BNDL` | `u32be utf8Length`, then that many UTF-8 bundle identifier bytes |
+| `SIZE` | `u16be width`, `u16be height` in the existing native-pixel coordinate space |
+| `TUCH`, `u8 phase`, `u16be x`, `u16be y` | No response; legacy streaming touch semantics |
+| `TSYN` | Exactly four ASCII bytes, `OKAY` or `FAIL` |
+| `TSEQ` and the body below | Exactly one four-byte ASCII `OKAY` or `FAIL`, if the connection remains usable |
+
+## TSEQ binary layout and validation
+
+All multibyte integers are unsigned and big-endian. Offsets below are relative to
+the payload, after the outer two-byte length prefix.
+
+| Offset | Size | Field |
+| --- | --- | --- |
+| 0 | 4 | ASCII `TSEQ` (`54 53 45 51`) |
+| 4 | 2 | `eventCount` |
+| `6 + 9*i` | 4 | Event `i`: `delayAfterPreviousEventUs` |
+| `10 + 9*i` | 1 | Event `i`: `phase` |
+| `11 + 9*i` | 2 | Event `i`: `x` |
+| `13 + 9*i` | 2 | Event `i`: `y` |
+
+`i` ranges from zero to `eventCount - 1`. The payload must be exactly
+`6 + 9 * eventCount` bytes; the complete framed request is two bytes longer.
+
+- Count: `1...1024`; the complete-gesture rule makes two the smallest valid count.
+- Phase: `0` = down, `1` = move, `3` = up; all other values are rejected.
+- Each delay: `0...30_000_000` microseconds, including the first delay.
+- Sum of all delays: at most `120_000_000` microseconds.
+- Coordinates: `0 <= x < width` and `0 <= y < height`, using the native dimensions
+  sampled before parsing. These are the existing `TUCH`/`SIZE` coordinates, not
+  necessarily `NATV` bitmap coordinates. Both commands use the same rounded
+  division by `scale` when dispatching to UIKit. Re-query `SIZE` after resizing;
+  do not resize the app during a gesture.
+- Gesture grammar: `(down move* up)+`. An inactive sequence accepts only down;
+  an active sequence accepts only move or up; the final state must be inactive.
+  Multiple complete gestures are permitted in one request. TSEQ cannot continue
+  a preceding TUCH hold with an initial move or up.
+
+The server validates the entire count, exact length, every event, and the final
+lifecycle before dispatching any event from the sequence. A rejection returns
+`FAIL` after cleaning up any pre-existing touch belonging to this connection.
+Validation is atomic; execution is not transactional and cannot be rolled back.
+
+For example, a zero-delay tap at `(100, 100)` is 26 bytes including framing:
+
+```text
+00 18                         # payloadLength = 24
+54 53 45 51 00 02             # TSEQ, eventCount = 2
+00 00 00 00 00 00 64 00 64    # delay = 0, down, x = 100, y = 100
+00 00 00 00 03 00 64 00 64    # delay = 0, up,   x = 100, y = 100
+```
+
+## Timing, ordered delivery, and acknowledgment
+
+The first delay is relative to the monotonic start of the sequence executor,
+after parsing. Each subsequent delay is relative to the preceding event's actual
+dispatch time, not the time its delivery acknowledgment arrives.
+
+After dispatching **every** event, TSEQ awaits the existing
+`PTFakeMetaTouch.syncPendingEvents(timeout:completion:)` delivery barrier before
+it may mutate that connection's touch again. Waiting for the barrier counts
+toward the next event's requested delay. Only the unelapsed part of the delay is
+passed to asynchronous `Task.sleep`; the main thread is not blocked by a sleep or
+a synchronous wait. A delayed barrier may lengthen an interval, never shorten it.
+Zero delay is valid but does not bypass ordered delivery.
+
+This barrier is necessary because PTFakeMetaTouch stores mutable UITouch objects,
+not immutable event snapshots. A sleep or yield alone would allow an up to replace
+an undelivered began, or a move to be ignored while the touch is still began.
+TSEQ does not intentionally coalesce moves: on `OKAY`, each requested event has
+passed its delivery barrier before the next one is dispatched. The final event's
+barrier also serves as the sequence's final synchronization. Internal barriers do
+not send extra replies, TSYN commands, or network round trips.
+
+Here, **delivered** means that PTFakeMetaTouch's RunLoop callback passed the current
+touch state to `UIApplication.sendEvent`, returned from that call, and advanced
+its delivery counter. It does not mean that the game accepted the action,
+completed an animation, or rendered a new screenshot. The barrier uses the
+existing global delivery counter and can include other pending input, but each
+connection owns its touch context; another client's touch cannot advance this
+sequence to its next event before this barrier completes.
+
+## Execution budget and client timeout
+
+Let `D` be the sum of all requested delays in seconds.
+
+- The executor has one shared monotonic deadline: `start + D + 3 seconds`.
+  The three seconds cover aggregate delivery/scheduling overhead, not three
+  seconds for every event.
+- Each internal delivery wait is capped at the smaller of three seconds and
+  the remaining execution budget. No zero-timeout/unbounded barrier is used.
+- Expiry or delivery failure stops further event dispatch. Cleanup can perform
+  one additional delivery wait of at most three seconds before returning `FAIL`.
+- Thus the conservative server-processing allowance is `D + 6 seconds`
+  (at most 126 seconds); successful execution is limited to `D + 3 seconds`.
+
+These are cooperative execution deadlines, not a hard real-time guarantee when
+the application's main thread is stalled or the process is suspended. The
+executor checks the deadline before dispatch and after each barrier, so it does
+not resume emitting overdue events after regaining execution. Network transport
+and time spent behind previously pipelined commands are not part of this budget.
+
+A client should keep one gesture in flight, hold its socket lock from request
+through response, and temporarily set its response timeout to at least
+`D + 6 seconds + network allowance` (for example, two more seconds on a local
+connection). Restore the previous timeout in `finally`. A fixed three- or
+five-second timeout is not sufficient for the existing 5.5-second long press.
+
+## Failures, cancellation, and replay safety
+
+`OKAY` is sent once, only after all events and their delivery barriers succeed.
+The sequence's touch lifecycle is then inactive. A malformed request, execution
+deadline, or delivery failure produces one `FAIL` when a response can still be
+sent. Connection failure can prevent any response, including after the gesture
+has already completed.
+
+`FAIL` and a lost response **do not mean safe to replay**. The same response covers
+parse rejection, partial execution, and failure to confirm final delivery. Some
+or all actions may already have affected the game. The protocol has no request
+IDs, rollback, or exactly-once replay facility. Do not blindly retry a TSEQ click
+or fall back to TUCH after sending it. Inspect the application's state and let the
+higher-level workflow decide whether a new action is appropriate.
+
+Cancellation, disconnect, receive-buffer overflow, parse rejection, and execution
+failure reuse this connection's `MaaToolsTouchState` cleanup. An active touch is
+cancelled at its last position; no other connection's touch is reset. Once the
+connection is marked closed, neither its active sequence nor buffered commands
+may continue dispatching. A cancelled/failed sequence may deliver only a prefix
+and a cancellation; it never acknowledges that prefix as a successful sequence.
+
+## Legacy and feedback-driven input
+
+TUCH retains the existing streaming phase/coordinate behavior and no-response
+format. TSYN retains its single `OKAY`/`FAIL` response and three-second delivery
+timeout. Its barrier confirms pending state; it cannot reconstruct phases that
+legacy TUCH calls have already overwritten before a barrier. For reliable
+streaming input, synchronize before mutating the same touch again.
+
+TSEQ is for gestures whose complete event list is known before sending. A
+feedback-driven hold that takes screenshots and decides when to release must
+continue using TUCH/TSYN with exception-safe release. Queuing a screenshot after
+an unfinished TSEQ on the same connection cannot provide mid-hold feedback.
+Clients with `VERN < 5` retain their supported legacy path; v5 does not require a
+PlayCover Manager change because its existing probe accepts `VERN >= 3` and
+validates BNDL.
+
+## Native verification
+
+Before native integration is approved, build the PlayTools scheme for iOS with
+Xcode as described above, and test in an isolated UIKit host
+(not a live game). Record actual responder-delivery phases and coordinates, not
+just the Toucher dispatch log. The required native cases are:
+
+1. Zero-delay down/up and zero/short-delay down/move/up: began, every requested
+   move, and ended are delivered in order before the single OKAY.
+2. Deliberately delay servicing the custom RunLoop source: no following phase is
+   dispatched until the prior delivery completes; expiry gives FAIL, not OKAY.
+3. Multiple gestures: each complete lifecycle is delivered before the next begins.
+4. Cancel a long hold: deliver cancelled, stop subsequent events, and clear only
+   that connection's context.
+5. Malformed frames/sequences and receive overflow: no new partial gesture for a
+   parse rejection, and no buffered dispatch after connection closure.
+6. Two concurrent connections: independent complete/cancelled lifecycles.
+7. Confirm execution/cleanup budgets, one response, legacy TUCH/TSYN behavior,
+   and unchanged VERN/BNDL/screenshot interfaces.
+
+Native build and delivery results must be obtained on a supported Mac before
+claiming native verification. Source inspection alone is not evidence of UIKit
+event delivery.
 
