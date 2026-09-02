@@ -3,7 +3,8 @@
 PlayTools is an essential part of [PlayCover](https://github.com/PlayCover/PlayCover). PlayTools implements core functions of PlayCover, including display control, key mapping and bypassing.
 
 The [MaaTools v5 protocol](#maatools-protocol-v5) documents automation touch
-sequences, delivery guarantees, timeouts, compatibility, and verification limits.
+sequences, framing, timing and delivery guarantees, timeout selection, failure
+handling, and compatibility.
 
 ## Display Control
 
@@ -263,43 +264,39 @@ For example, a zero-delay tap at `(100, 100)` is 26 bytes including framing:
 
 ## Timing, ordered delivery, and acknowledgment
 
-The first delay is relative to the monotonic start of the sequence executor,
-after parsing. Each subsequent delay is relative to the preceding event's actual
+The first delay is relative to the monotonic start of sequence processing, after
+parsing. Each subsequent delay is relative to the preceding event's actual
 dispatch time, not the time its delivery acknowledgment arrives.
 
-After dispatching **every** event, TSEQ awaits the existing
-`PTFakeMetaTouch.syncPendingEvents(timeout:completion:)` delivery barrier before
-it may mutate that connection's touch again. Waiting for the barrier counts
-toward the next event's requested delay. Only the unelapsed part of the delay is
-passed to asynchronous `Task.sleep`; the main thread is not blocked by a sleep or
-a synchronous wait. A delayed barrier may lengthen an interval, never shorten it.
-Zero delay is valid but does not bypass ordered delivery.
+After dispatching **every** event, TSEQ waits for a server-side delivery barrier
+before dispatching the next event for that connection. Waiting for the barrier
+counts toward the next event's requested delay, so only the unelapsed part of the
+delay is waited asynchronously. A delayed barrier may lengthen an interval, never
+shorten it. Zero delay is valid but does not bypass ordered delivery.
 
-This barrier is necessary because PTFakeMetaTouch stores mutable UITouch objects,
-not immutable event snapshots. A sleep or yield alone would allow an up to replace
-an undelivered began, or a move to be ignored while the touch is still began.
-TSEQ does not intentionally coalesce moves: on `OKAY`, each requested event has
-passed its delivery barrier before the next one is dispatched. The final event's
-barrier also serves as the sequence's final synchronization. Internal barriers do
-not send extra replies, TSYN commands, or network round trips.
+The barrier prevents a later phase from replacing an event that has not yet been
+delivered. TSEQ does not intentionally coalesce moves: on `OKAY`, each requested
+event has passed its delivery barrier before the next one is dispatched. The final
+event's barrier also serves as the sequence's final synchronization. These
+barriers do not send extra replies, TSYN commands, or network round trips.
 
-Here, **delivered** means that PTFakeMetaTouch's RunLoop callback passed the current
-touch state to `UIApplication.sendEvent`, returned from that call, and advanced
-its delivery counter. It does not mean that the game accepted the action,
-completed an animation, or rendered a new screenshot. The barrier uses the
-existing global delivery counter and can include other pending input, but each
-connection owns its touch context; another client's touch cannot advance this
-sequence to its next event before this barrier completes.
+Here, **delivered** means that the server has returned from submitting the current
+touch state to the app's UIKit event pipeline. It does not mean that the game
+accepted the action, completed an animation, or rendered a new screenshot. The
+delivery mechanism can include other pending input, but each connection owns its
+touch context; another client's touch cannot advance this sequence to its next
+event before the barrier completes.
 
 ## Execution budget and client timeout
 
 Let `D` be the sum of all requested delays in seconds.
 
-- The executor has one shared monotonic deadline: `start + D + 3 seconds`.
+- The server gives the sequence one shared monotonic deadline:
+  `start + D + 3 seconds`.
   The three seconds cover aggregate delivery/scheduling overhead, not three
   seconds for every event.
-- Each internal delivery wait is capped at the smaller of three seconds and
-  the remaining execution budget. No zero-timeout/unbounded barrier is used.
+- Each delivery wait is capped at the smaller of three seconds and the remaining
+  execution budget; no individual wait is unbounded.
 - Expiry or delivery failure stops further event dispatch. Cleanup can perform
   one additional delivery wait of at most three seconds before returning `FAIL`.
 - Thus the conservative server-processing allowance is `D + 6 seconds`
@@ -307,7 +304,7 @@ Let `D` be the sum of all requested delays in seconds.
 
 These are cooperative execution deadlines, not a hard real-time guarantee when
 the application's main thread is stalled or the process is suspended. The
-executor checks the deadline before dispatch and after each barrier, so it does
+server checks the deadline before dispatch and after each barrier, so it does
 not resume emitting overdue events after regaining execution. Network transport
 and time spent behind previously pipelined commands are not part of this budget.
 
@@ -333,11 +330,11 @@ or fall back to TUCH after sending it. Inspect the application's state and let t
 higher-level workflow decide whether a new action is appropriate.
 
 Cancellation, disconnect, receive-buffer overflow, parse rejection, and execution
-failure reuse this connection's `MaaToolsTouchState` cleanup. An active touch is
-cancelled at its last position; no other connection's touch is reset. Once the
-connection is marked closed, neither its active sequence nor buffered commands
-may continue dispatching. A cancelled/failed sequence may deliver only a prefix
-and a cancellation; it never acknowledges that prefix as a successful sequence.
+failure trigger cleanup for that connection. An active touch is cancelled at its
+last position; no other connection's touch is reset. Once the connection is marked
+closed, neither its active sequence nor buffered commands may continue dispatching.
+A cancelled/failed sequence may deliver only a prefix and a cancellation; it never
+acknowledges that prefix as a successful sequence.
 
 ## Legacy and feedback-driven input
 
@@ -354,28 +351,3 @@ an unfinished TSEQ on the same connection cannot provide mid-hold feedback.
 Clients with `VERN < 5` retain their supported legacy path; v5 does not require a
 PlayCover Manager change because its existing probe accepts `VERN >= 3` and
 validates BNDL.
-
-## Native verification
-
-Before native integration is approved, build the PlayTools scheme for iOS with
-Xcode as described above, and test in an isolated UIKit host
-(not a live game). Record actual responder-delivery phases and coordinates, not
-just the Toucher dispatch log. The required native cases are:
-
-1. Zero-delay down/up and zero/short-delay down/move/up: began, every requested
-   move, and ended are delivered in order before the single OKAY.
-2. Deliberately delay servicing the custom RunLoop source: no following phase is
-   dispatched until the prior delivery completes; expiry gives FAIL, not OKAY.
-3. Multiple gestures: each complete lifecycle is delivered before the next begins.
-4. Cancel a long hold: deliver cancelled, stop subsequent events, and clear only
-   that connection's context.
-5. Malformed frames/sequences and receive overflow: no new partial gesture for a
-   parse rejection, and no buffered dispatch after connection closure.
-6. Two concurrent connections: independent complete/cancelled lifecycles.
-7. Confirm execution/cleanup budgets, one response, legacy TUCH/TSYN behavior,
-   and unchanged VERN/BNDL/screenshot interfaces.
-
-Native build and delivery results must be obtained on a supported Mac before
-claiming native verification. Source inspection alone is not evidence of UIKit
-event delivery.
-
